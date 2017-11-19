@@ -3,25 +3,27 @@
 package signature
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"strings"
+
+	"github.com/pkg/errors"
 
 	"github.com/containers/image/manifest"
 	"github.com/containers/image/types"
+	"github.com/opencontainers/go-digest"
 )
 
-func (pr *prSignedBy) isSignatureAuthorAccepted(image types.Image, sig []byte) (signatureAcceptanceResult, *Signature, error) {
+func (pr *prSignedBy) isSignatureAuthorAccepted(image types.UnparsedImage, sig []byte) (signatureAcceptanceResult, *Signature, error) {
 	switch pr.KeyType {
 	case SBKeyTypeGPGKeys:
 	case SBKeyTypeSignedByGPGKeys, SBKeyTypeX509Certificates, SBKeyTypeSignedByX509CAs:
 		// FIXME? Reject this at policy parsing time already?
-		return sarRejected, nil, fmt.Errorf(`"Unimplemented "keyType" value "%s"`, string(pr.KeyType))
+		return sarRejected, nil, errors.Errorf(`"Unimplemented "keyType" value "%s"`, string(pr.KeyType))
 	default:
 		// This should never happen, newPRSignedBy ensures KeyType.IsValid()
-		return sarRejected, nil, fmt.Errorf(`"Unknown "keyType" value "%s"`, string(pr.KeyType))
+		return sarRejected, nil, errors.Errorf(`"Unknown "keyType" value "%s"`, string(pr.KeyType))
 	}
 
 	if pr.KeyPath != "" && pr.KeyData != nil {
@@ -40,20 +42,11 @@ func (pr *prSignedBy) isSignatureAuthorAccepted(image types.Image, sig []byte) (
 	}
 
 	// FIXME: move this to per-context initialization
-	dir, err := ioutil.TempDir("", "skopeo-signedBy-")
+	mech, trustedIdentities, err := NewEphemeralGPGSigningMechanism(data)
 	if err != nil {
 		return sarRejected, nil, err
 	}
-	defer os.RemoveAll(dir)
-	mech, err := newGPGSigningMechanismInDirectory(dir)
-	if err != nil {
-		return sarRejected, nil, err
-	}
-
-	trustedIdentities, err := mech.ImportKeysFromBytes(data)
-	if err != nil {
-		return sarRejected, nil, err
-	}
+	defer mech.Close()
 	if len(trustedIdentities) == 0 {
 		return sarRejected, nil, PolicyRequirementError("No public keys imported")
 	}
@@ -75,7 +68,7 @@ func (pr *prSignedBy) isSignatureAuthorAccepted(image types.Image, sig []byte) (
 			}
 			return nil
 		},
-		validateSignedDockerManifestDigest: func(digest string) error {
+		validateSignedDockerManifestDigest: func(digest digest.Digest) error {
 			m, _, err := image.Manifest()
 			if err != nil {
 				return err
@@ -97,8 +90,9 @@ func (pr *prSignedBy) isSignatureAuthorAccepted(image types.Image, sig []byte) (
 	return sarAccepted, signature, nil
 }
 
-func (pr *prSignedBy) isRunningImageAllowed(image types.Image) (bool, error) {
-	sigs, err := image.Signatures()
+func (pr *prSignedBy) isRunningImageAllowed(image types.UnparsedImage) (bool, error) {
+	// FIXME: pass context.Context
+	sigs, err := image.Signatures(context.TODO())
 	if err != nil {
 		return false, err
 	}
@@ -115,7 +109,7 @@ func (pr *prSignedBy) isRunningImageAllowed(image types.Image) (bool, error) {
 			// Huh?! This should not happen at all; treat it as any other invalid value.
 			fallthrough
 		default:
-			reason = fmt.Errorf(`Internal error: Unexpected signature verification result "%s"`, string(res))
+			reason = errors.Errorf(`Internal error: Unexpected signature verification result "%s"`, string(res))
 		}
 		rejections = append(rejections, reason)
 	}

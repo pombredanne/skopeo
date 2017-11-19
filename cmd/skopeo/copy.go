@@ -3,92 +3,158 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 
-	"github.com/containers/image/image"
-	"github.com/containers/image/signature"
+	"github.com/containers/image/copy"
+	"github.com/containers/image/manifest"
+	"github.com/containers/image/transports"
+	"github.com/containers/image/transports/alltransports"
+	"github.com/containers/image/types"
+	imgspecv1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/urfave/cli"
 )
+
+// contextsFromGlobalOptions returns source and destionation types.SystemContext depending on c.
+func contextsFromGlobalOptions(c *cli.Context) (*types.SystemContext, *types.SystemContext, error) {
+	sourceCtx, err := contextFromGlobalOptions(c, "src-")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	destinationCtx, err := contextFromGlobalOptions(c, "dest-")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return sourceCtx, destinationCtx, nil
+}
 
 func copyHandler(context *cli.Context) error {
 	if len(context.Args()) != 2 {
 		return errors.New("Usage: copy source destination")
 	}
 
-	dest, err := parseImageDestination(context, context.Args()[1])
+	policyContext, err := getPolicyContext(context)
 	if err != nil {
-		return fmt.Errorf("Error initializing %s: %v", context.Args()[1], err)
+		return fmt.Errorf("Error loading trust policy: %v", err)
 	}
+	defer policyContext.Destroy()
 
-	rawSource, err := parseImageSource(context, context.Args()[0])
+	srcRef, err := alltransports.ParseImageName(context.Args()[0])
 	if err != nil {
-		return fmt.Errorf("Error initializing %s: %v", context.Args()[0], err)
+		return fmt.Errorf("Invalid source name %s: %v", context.Args()[0], err)
 	}
-	src := image.FromSource(rawSource, dest.SupportedManifestMIMETypes())
-
+	destRef, err := alltransports.ParseImageName(context.Args()[1])
+	if err != nil {
+		return fmt.Errorf("Invalid destination name %s: %v", context.Args()[1], err)
+	}
 	signBy := context.String("sign-by")
+	removeSignatures := context.Bool("remove-signatures")
 
-	manifest, _, err := src.Manifest()
+	sourceCtx, destinationCtx, err := contextsFromGlobalOptions(context)
 	if err != nil {
-		return fmt.Errorf("Error reading manifest: %v", err)
+		return err
 	}
 
-	blobDigests, err := src.BlobDigests()
-	if err != nil {
-		return fmt.Errorf("Error parsing manifest: %v", err)
-	}
-	for _, digest := range blobDigests {
-		// TODO(mitr): do not ignore the size param returned here
-		stream, _, err := rawSource.GetBlob(digest)
-		if err != nil {
-			return fmt.Errorf("Error reading blob %s: %v", digest, err)
-		}
-		defer stream.Close()
-		if err := dest.PutBlob(digest, stream); err != nil {
-			return fmt.Errorf("Error writing blob: %v", err)
+	var manifestType string
+	if context.IsSet("format") {
+		switch context.String("format") {
+		case "oci":
+			manifestType = imgspecv1.MediaTypeImageManifest
+		case "v2s1":
+			manifestType = manifest.DockerV2Schema1SignedMediaType
+		case "v2s2":
+			manifestType = manifest.DockerV2Schema2MediaType
+		default:
+			return fmt.Errorf("unknown format %q. Choose on of the supported formats: 'oci', 'v2s1', or 'v2s2'", context.String("format"))
 		}
 	}
 
-	sigs, err := src.Signatures()
-	if err != nil {
-		return fmt.Errorf("Error reading signatures: %v", err)
-	}
-
-	if signBy != "" {
-		mech, err := signature.NewGPGSigningMechanism()
-		if err != nil {
-			return fmt.Errorf("Error initializing GPG: %v", err)
-		}
-		dockerReference := dest.CanonicalDockerReference()
-		if dockerReference == nil {
-			return errors.New("Destination image does not have an associated Docker reference")
-		}
-
-		newSig, err := signature.SignDockerManifest(manifest, dockerReference.String(), mech, signBy)
-		if err != nil {
-			return fmt.Errorf("Error creating signature: %v", err)
-		}
-		sigs = append(sigs, newSig)
-	}
-
-	if err := dest.PutSignatures(sigs); err != nil {
-		return fmt.Errorf("Error writing signatures: %v", err)
-	}
-
-	// FIXME: We need to call PutManifest after PutBlob and PutSignatures. This seems ugly; move to a "set properties" + "commit" model?
-	if err := dest.PutManifest(manifest); err != nil {
-		return fmt.Errorf("Error writing manifest: %v", err)
-	}
-	return nil
+	return copy.Image(policyContext, destRef, srcRef, &copy.Options{
+		RemoveSignatures:      removeSignatures,
+		SignBy:                signBy,
+		ReportWriter:          os.Stdout,
+		SourceCtx:             sourceCtx,
+		DestinationCtx:        destinationCtx,
+		ForceManifestMIMEType: manifestType,
+	})
 }
 
 var copyCmd = cli.Command{
-	Name:   "copy",
-	Action: copyHandler,
+	Name:  "copy",
+	Usage: "Copy an IMAGE-NAME from one location to another",
+	Description: fmt.Sprintf(`
+
+	Container "IMAGE-NAME" uses a "transport":"details" format.
+
+	Supported transports:
+	%s
+
+	See skopeo(1) section "IMAGE NAMES" for the expected format
+	`, strings.Join(transports.ListNames(), ", ")),
+	ArgsUsage: "SOURCE-IMAGE DESTINATION-IMAGE",
+	Action:    copyHandler,
 	// FIXME: Do we need to namespace the GPG aspect?
 	Flags: []cli.Flag{
+		cli.BoolFlag{
+			Name:  "remove-signatures",
+			Usage: "Do not copy signatures from SOURCE-IMAGE",
+		},
 		cli.StringFlag{
 			Name:  "sign-by",
-			Usage: "sign the image using a GPG key with the specified fingerprint",
+			Usage: "Sign the image using a GPG key with the specified `FINGERPRINT`",
+		},
+		cli.StringFlag{
+			Name:  "src-creds, screds",
+			Value: "",
+			Usage: "Use `USERNAME[:PASSWORD]` for accessing the source registry",
+		},
+		cli.StringFlag{
+			Name:  "dest-creds, dcreds",
+			Value: "",
+			Usage: "Use `USERNAME[:PASSWORD]` for accessing the destination registry",
+		},
+		cli.StringFlag{
+			Name:  "src-cert-dir",
+			Value: "",
+			Usage: "use certificates at `PATH` (*.crt, *.cert, *.key) to connect to the source registry",
+		},
+		cli.BoolTFlag{
+			Name:  "src-tls-verify",
+			Usage: "require HTTPS and verify certificates when talking to the container source registry (defaults to true)",
+		},
+		cli.StringFlag{
+			Name:  "dest-cert-dir",
+			Value: "",
+			Usage: "use certificates at `PATH` (*.crt, *.cert, *.key) to connect to the destination registry",
+		},
+		cli.BoolTFlag{
+			Name:  "dest-tls-verify",
+			Usage: "require HTTPS and verify certificates when talking to the container destination registry (defaults to true)",
+		},
+		cli.StringFlag{
+			Name:  "dest-ostree-tmp-dir",
+			Value: "",
+			Usage: "`DIRECTORY` to use for OSTree temporary files",
+		},
+		cli.StringFlag{
+			Name:  "src-shared-blob-dir",
+			Value: "",
+			Usage: "`DIRECTORY` to use to fetch retrieved blobs (OCI layout sources only)",
+		},
+		cli.StringFlag{
+			Name:  "dest-shared-blob-dir",
+			Value: "",
+			Usage: "`DIRECTORY` to use to store retrieved blobs (OCI layout destinations only)",
+		},
+		cli.StringFlag{
+			Name:  "format, f",
+			Usage: "`MANIFEST TYPE` (oci, v2s1, or v2s2) to use when saving image to directory using the 'dir:' transport (default is manifest type of source)",
+		},
+		cli.BoolFlag{
+			Name:  "dest-compress",
+			Usage: "Compress tarball image layers when saving to directory using the 'dir' transport. (default is same compression type as source)",
 		},
 	},
 }

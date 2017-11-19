@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"io"
+	"io/ioutil"
 	"net"
 	"os/exec"
 	"strings"
@@ -74,9 +76,15 @@ func assertSkopeoFails(c *check.C, regexp string, args ...string) {
 // runCommandWithInput runs a command as if exec.Command(), sending it the input to stdin,
 // and verifies that the exit status is 0, or terminates c on failure.
 func runCommandWithInput(c *check.C, input string, name string, args ...string) {
-	c.Logf("Running %s %s", name, strings.Join(args, " "))
 	cmd := exec.Command(name, args...)
-	consumeAndLogOutputs(c, name+" "+strings.Join(args, " "), cmd)
+	runExecCmdWithInput(c, cmd, input)
+}
+
+// runExecCmdWithInput runs an exec.Cmd, sending it the input to stdin,
+// and verifies that the exit status is 0, or terminates c on failure.
+func runExecCmdWithInput(c *check.C, cmd *exec.Cmd, input string) {
+	c.Logf("Running %s %s", cmd.Path, strings.Join(cmd.Args, " "))
+	consumeAndLogOutputs(c, cmd.Path+" "+strings.Join(cmd.Args, " "), cmd)
 	stdin, err := cmd.StdinPipe()
 	c.Assert(err, check.IsNil)
 	err = cmd.Start()
@@ -143,4 +151,26 @@ func modifyEnviron(env []string, name, value string) []string {
 		}
 	}
 	return append(res, prefix+value)
+}
+
+// fileFromFixtureFixture applies edits to inputPath and returns a path to the temporary file.
+// Callers should defer os.Remove(the_returned_path)
+func fileFromFixture(c *check.C, inputPath string, edits map[string]string) string {
+	contents, err := ioutil.ReadFile(inputPath)
+	c.Assert(err, check.IsNil)
+	for template, value := range edits {
+		updated := bytes.Replace(contents, []byte(template), []byte(value), -1)
+		c.Assert(bytes.Equal(updated, contents), check.Equals, false, check.Commentf("Replacing %s in %#v failed", template, string(contents))) // Verify that the template has matched something and we are not silently ignoring it.
+		contents = updated
+	}
+
+	file, err := ioutil.TempFile("", "policy.json")
+	c.Assert(err, check.IsNil)
+	path := file.Name()
+
+	_, err = file.Write(contents)
+	c.Assert(err, check.IsNil)
+	err = file.Close()
+	c.Assert(err, check.IsNil)
+	return path
 }

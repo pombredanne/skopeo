@@ -4,7 +4,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -14,13 +13,14 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/ghodss/yaml"
 	"github.com/imdario/mergo"
-	utilerrors "k8s.io/kubernetes/pkg/util/errors"
-	"k8s.io/kubernetes/pkg/util/homedir"
-	utilnet "k8s.io/kubernetes/pkg/util/net"
+	"github.com/pkg/errors"
+	"golang.org/x/net/http2"
+	"k8s.io/client-go/util/homedir"
 )
 
 // restTLSClientConfig is a modified copy of k8s.io/kubernets/pkg/client/restclient.TLSClientConfig.
@@ -348,20 +348,20 @@ func validateClusterInfo(clusterName string, clusterInfo clientcmdCluster) []err
 
 	if len(clusterInfo.Server) == 0 {
 		if len(clusterName) == 0 {
-			validationErrors = append(validationErrors, fmt.Errorf("default cluster has no server defined"))
+			validationErrors = append(validationErrors, errors.Errorf("default cluster has no server defined"))
 		} else {
-			validationErrors = append(validationErrors, fmt.Errorf("no server found for cluster %q", clusterName))
+			validationErrors = append(validationErrors, errors.Errorf("no server found for cluster %q", clusterName))
 		}
 	}
 	// Make sure CA data and CA file aren't both specified
 	if len(clusterInfo.CertificateAuthority) != 0 && len(clusterInfo.CertificateAuthorityData) != 0 {
-		validationErrors = append(validationErrors, fmt.Errorf("certificate-authority-data and certificate-authority are both specified for %v. certificate-authority-data will override", clusterName))
+		validationErrors = append(validationErrors, errors.Errorf("certificate-authority-data and certificate-authority are both specified for %v. certificate-authority-data will override", clusterName))
 	}
 	if len(clusterInfo.CertificateAuthority) != 0 {
 		clientCertCA, err := os.Open(clusterInfo.CertificateAuthority)
 		defer clientCertCA.Close()
 		if err != nil {
-			validationErrors = append(validationErrors, fmt.Errorf("unable to read certificate-authority %v for %v due to %v", clusterInfo.CertificateAuthority, clusterName, err))
+			validationErrors = append(validationErrors, errors.Errorf("unable to read certificate-authority %v for %v due to %v", clusterInfo.CertificateAuthority, clusterName, err))
 		}
 	}
 
@@ -385,36 +385,36 @@ func validateAuthInfo(authInfoName string, authInfo clientcmdAuthInfo) []error {
 	if len(authInfo.ClientCertificate) != 0 || len(authInfo.ClientCertificateData) != 0 {
 		// Make sure cert data and file aren't both specified
 		if len(authInfo.ClientCertificate) != 0 && len(authInfo.ClientCertificateData) != 0 {
-			validationErrors = append(validationErrors, fmt.Errorf("client-cert-data and client-cert are both specified for %v. client-cert-data will override", authInfoName))
+			validationErrors = append(validationErrors, errors.Errorf("client-cert-data and client-cert are both specified for %v. client-cert-data will override", authInfoName))
 		}
 		// Make sure key data and file aren't both specified
 		if len(authInfo.ClientKey) != 0 && len(authInfo.ClientKeyData) != 0 {
-			validationErrors = append(validationErrors, fmt.Errorf("client-key-data and client-key are both specified for %v; client-key-data will override", authInfoName))
+			validationErrors = append(validationErrors, errors.Errorf("client-key-data and client-key are both specified for %v; client-key-data will override", authInfoName))
 		}
 		// Make sure a key is specified
 		if len(authInfo.ClientKey) == 0 && len(authInfo.ClientKeyData) == 0 {
-			validationErrors = append(validationErrors, fmt.Errorf("client-key-data or client-key must be specified for %v to use the clientCert authentication method", authInfoName))
+			validationErrors = append(validationErrors, errors.Errorf("client-key-data or client-key must be specified for %v to use the clientCert authentication method", authInfoName))
 		}
 
 		if len(authInfo.ClientCertificate) != 0 {
 			clientCertFile, err := os.Open(authInfo.ClientCertificate)
 			defer clientCertFile.Close()
 			if err != nil {
-				validationErrors = append(validationErrors, fmt.Errorf("unable to read client-cert %v for %v due to %v", authInfo.ClientCertificate, authInfoName, err))
+				validationErrors = append(validationErrors, errors.Errorf("unable to read client-cert %v for %v due to %v", authInfo.ClientCertificate, authInfoName, err))
 			}
 		}
 		if len(authInfo.ClientKey) != 0 {
 			clientKeyFile, err := os.Open(authInfo.ClientKey)
 			defer clientKeyFile.Close()
 			if err != nil {
-				validationErrors = append(validationErrors, fmt.Errorf("unable to read client-key %v for %v due to %v", authInfo.ClientKey, authInfoName, err))
+				validationErrors = append(validationErrors, errors.Errorf("unable to read client-key %v for %v due to %v", authInfo.ClientKey, authInfoName, err))
 			}
 		}
 	}
 
 	// authPath also provides information for the client to identify the server, so allow multiple auth methods in that case
 	if (len(methods) > 1) && (!usingAuthPath) {
-		validationErrors = append(validationErrors, fmt.Errorf("more than one authentication method found for %v; found %v, only one is allowed", authInfoName, methods))
+		validationErrors = append(validationErrors, errors.Errorf("more than one authentication method found for %v; found %v, only one is allowed", authInfoName, methods))
 	}
 
 	return validationErrors
@@ -450,6 +450,55 @@ func (config *directClientConfig) getCluster() clientcmdCluster {
 	return mergedClusterInfo
 }
 
+// aggregateErr is a modified copy of k8s.io/apimachinery/pkg/util/errors.aggregate.
+// This helper implements the error and Errors interfaces.  Keeping it private
+// prevents people from making an aggregate of 0 errors, which is not
+// an error, but does satisfy the error interface.
+type aggregateErr []error
+
+// newAggregate is a modified copy of k8s.io/apimachinery/pkg/util/errors.NewAggregate.
+// NewAggregate converts a slice of errors into an Aggregate interface, which
+// is itself an implementation of the error interface.  If the slice is empty,
+// this returns nil.
+// It will check if any of the element of input error list is nil, to avoid
+// nil pointer panic when call Error().
+func newAggregate(errlist []error) error {
+	if len(errlist) == 0 {
+		return nil
+	}
+	// In case of input error list contains nil
+	var errs []error
+	for _, e := range errlist {
+		if e != nil {
+			errs = append(errs, e)
+		}
+	}
+	if len(errs) == 0 {
+		return nil
+	}
+	return aggregateErr(errs)
+}
+
+// Error is a modified copy of k8s.io/apimachinery/pkg/util/errors.aggregate.Error.
+// Error is part of the error interface.
+func (agg aggregateErr) Error() string {
+	if len(agg) == 0 {
+		// This should never happen, really.
+		return ""
+	}
+	if len(agg) == 1 {
+		return agg[0].Error()
+	}
+	result := fmt.Sprintf("[%s", agg[0].Error())
+	for i := 1; i < len(agg); i++ {
+		result += fmt.Sprintf(", %s", agg[i].Error())
+	}
+	result += "]"
+	return result
+}
+
+// REMOVED: aggregateErr.Errors
+
 // errConfigurationInvalid is a modified? copy of k8s.io/kubernetes/pkg/client/unversioned/clientcmd.errConfigurationInvalid.
 // errConfigurationInvalid is a set of errors indicating the configuration is invalid.
 type errConfigurationInvalid []error
@@ -470,7 +519,7 @@ func newErrConfigurationInvalid(errs []error) error {
 
 // Error implements the error interface
 func (e errConfigurationInvalid) Error() string {
-	return fmt.Sprintf("invalid configuration: %v", utilerrors.NewAggregate(e).Error())
+	return fmt.Sprintf("invalid configuration: %v", newAggregate(e).Error())
 }
 
 // clientConfigLoadingRules is a modified copy of k8s.io/kubernetes/pkg/client/unversioned/clientcmd.ClientConfigLoadingRules
@@ -518,7 +567,7 @@ func (rules *clientConfigLoadingRules) Load() (*clientcmdConfig, error) {
 			continue
 		}
 		if err != nil {
-			errlist = append(errlist, fmt.Errorf("Error loading config file \"%s\": %v", filename, err))
+			errlist = append(errlist, errors.Wrapf(err, "Error loading config file \"%s\"", filename))
 			continue
 		}
 
@@ -550,7 +599,7 @@ func (rules *clientConfigLoadingRules) Load() (*clientcmdConfig, error) {
 		errlist = append(errlist, err)
 	}
 
-	return config, utilerrors.NewAggregate(errlist)
+	return config, newAggregate(errlist)
 }
 
 // loadFromFile is a modified copy of k8s.io/kubernetes/pkg/client/unversioned/clientcmd.LoadFromFile
@@ -623,7 +672,7 @@ func resolveLocalPaths(config *clientcmdConfig) error {
 		}
 		base, err := filepath.Abs(filepath.Dir(cluster.LocationOfOrigin))
 		if err != nil {
-			return fmt.Errorf("Could not determine the absolute path of config file %s: %v", cluster.LocationOfOrigin, err)
+			return errors.Wrapf(err, "Could not determine the absolute path of config file %s", cluster.LocationOfOrigin)
 		}
 
 		if err := resolvePaths(getClusterFileReferences(cluster), base); err != nil {
@@ -636,7 +685,7 @@ func resolveLocalPaths(config *clientcmdConfig) error {
 		}
 		base, err := filepath.Abs(filepath.Dir(authInfo.LocationOfOrigin))
 		if err != nil {
-			return fmt.Errorf("Could not determine the absolute path of config file %s: %v", authInfo.LocationOfOrigin, err)
+			return errors.Wrapf(err, "Could not determine the absolute path of config file %s", authInfo.LocationOfOrigin)
 		}
 
 		if err := resolvePaths(getAuthInfoFileReferences(authInfo), base); err != nil {
@@ -706,7 +755,7 @@ func restClientFor(config *restConfig) (*url.URL, *http.Client, error) {
 // Kubernetes API.
 func defaultServerURL(host string, defaultTLS bool) (*url.URL, error) {
 	if host == "" {
-		return nil, fmt.Errorf("host must be a URL or a host:port pair")
+		return nil, errors.Errorf("host must be a URL or a host:port pair")
 	}
 	base := host
 	hostURL, err := url.Parse(base)
@@ -723,7 +772,7 @@ func defaultServerURL(host string, defaultTLS bool) (*url.URL, error) {
 			return nil, err
 		}
 		if hostURL.Path != "" && hostURL.Path != "/" {
-			return nil, fmt.Errorf("host must be a URL or a host:port pair: %q", base)
+			return nil, errors.Errorf("host must be a URL or a host:port pair: %q", base)
 		}
 	}
 
@@ -793,10 +842,56 @@ func transportNew(config *restConfig) (http.RoundTripper, error) {
 
 	// REMOVED: HTTPWrappersForConfig(config, rt) in favor of the caller setting HTTP headers itself based on restConfig. Only this inlined check remains.
 	if len(config.Username) != 0 && len(config.BearerToken) != 0 {
-		return nil, fmt.Errorf("username/password or bearer token may be set, but not both")
+		return nil, errors.Errorf("username/password or bearer token may be set, but not both")
 	}
 
 	return rt, nil
+}
+
+// newProxierWithNoProxyCIDR is a modified copy of k8s.io/apimachinery/pkg/util/net.NewProxierWithNoProxyCIDR.
+// NewProxierWithNoProxyCIDR constructs a Proxier function that respects CIDRs in NO_PROXY and delegates if
+// no matching CIDRs are found
+func newProxierWithNoProxyCIDR(delegate func(req *http.Request) (*url.URL, error)) func(req *http.Request) (*url.URL, error) {
+	// we wrap the default method, so we only need to perform our check if the NO_PROXY envvar has a CIDR in it
+	noProxyEnv := os.Getenv("NO_PROXY")
+	noProxyRules := strings.Split(noProxyEnv, ",")
+
+	cidrs := []*net.IPNet{}
+	for _, noProxyRule := range noProxyRules {
+		_, cidr, _ := net.ParseCIDR(noProxyRule)
+		if cidr != nil {
+			cidrs = append(cidrs, cidr)
+		}
+	}
+
+	if len(cidrs) == 0 {
+		return delegate
+	}
+
+	return func(req *http.Request) (*url.URL, error) {
+		host := req.URL.Host
+		// for some urls, the Host is already the host, not the host:port
+		if net.ParseIP(host) == nil {
+			var err error
+			host, _, err = net.SplitHostPort(req.URL.Host)
+			if err != nil {
+				return delegate(req)
+			}
+		}
+
+		ip := net.ParseIP(host)
+		if ip == nil {
+			return delegate(req)
+		}
+
+		for _, cidr := range cidrs {
+			if cidr.Contains(ip) {
+				return nil, nil
+			}
+		}
+
+		return delegate(req)
+	}
 }
 
 // tlsCacheGet is a modified copy of k8s.io/kubernetes/pkg/client/transport.tlsTransportCache.get.
@@ -813,15 +908,23 @@ func tlsCacheGet(config *restConfig) (http.RoundTripper, error) {
 		return http.DefaultTransport, nil
 	}
 
-	return utilnet.SetTransportDefaults(&http.Transport{ // FIXME??
-		Proxy:               http.ProxyFromEnvironment,
+	// REMOVED: Call to k8s.io/apimachinery/pkg/util/net.SetTransportDefaults; instead of the generic machinery and conditionals, hard-coded the result here.
+	t := &http.Transport{
+		// http.ProxyFromEnvironment doesn't respect CIDRs and that makes it impossible to exclude things like pod and service IPs from proxy settings
+		// ProxierWithNoProxyCIDR allows CIDR rules in NO_PROXY
+		Proxy:               newProxierWithNoProxyCIDR(http.ProxyFromEnvironment),
 		TLSHandshakeTimeout: 10 * time.Second,
 		TLSClientConfig:     tlsConfig,
 		Dial: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).Dial,
-	}), nil
+	}
+	// Allow clients to disable http2 if needed.
+	if s := os.Getenv("DISABLE_HTTP2"); len(s) == 0 {
+		_ = http2.ConfigureTransport(t)
+	}
+	return t, nil
 }
 
 // tlsConfigFor is a modified copy of k8s.io/kubernetes/pkg/client/transport.TLSConfigFor.
@@ -832,7 +935,7 @@ func tlsConfigFor(c *restConfig) (*tls.Config, error) {
 		return nil, nil
 	}
 	if c.HasCA() && c.Insecure {
-		return nil, fmt.Errorf("specifying a root certificates file with the insecure flag is not allowed")
+		return nil, errors.Errorf("specifying a root certificates file with the insecure flag is not allowed")
 	}
 	if err := loadTLSFiles(c); err != nil {
 		return nil, err
@@ -950,7 +1053,8 @@ func (m *clustersMap) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	for _, e := range a {
-		(*m)[e.Name] = &e.Cluster
+		cluster := e.Cluster // Allocates a new instance in each iteration
+		(*m)[e.Name] = &cluster
 	}
 	return nil
 }
@@ -963,7 +1067,8 @@ func (m *authInfosMap) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	for _, e := range a {
-		(*m)[e.Name] = &e.AuthInfo
+		authInfo := e.AuthInfo // Allocates a new instance in each iteration
+		(*m)[e.Name] = &authInfo
 	}
 	return nil
 }
@@ -976,7 +1081,8 @@ func (m *contextsMap) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	for _, e := range a {
-		(*m)[e.Name] = &e.Context
+		context := e.Context // Allocates a new instance in each iteration
+		(*m)[e.Name] = &context
 	}
 	return nil
 }

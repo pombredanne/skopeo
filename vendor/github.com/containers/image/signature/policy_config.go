@@ -17,9 +17,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"path/filepath"
 
-	"github.com/docker/docker/reference"
+	"github.com/containers/image/docker/reference"
+	"github.com/containers/image/transports"
+	"github.com/containers/image/types"
+	"github.com/pkg/errors"
 )
+
+// systemDefaultPolicyPath is the policy path used for DefaultPolicy().
+// You can override this at build time with
+// -ldflags '-X github.com/containers/image/signature.systemDefaultPolicyPath=$your_path'
+var systemDefaultPolicyPath = builtinDefaultPolicyPath
+
+// builtinDefaultPolicyPath is the policy pat used for DefaultPolicy().
+// DO NOT change this, instead see systemDefaultPolicyPath above.
+const builtinDefaultPolicyPath = "/etc/containers/policy.json"
 
 // InvalidPolicyFormatError is returned when parsing an invalid policy configuration.
 type InvalidPolicyFormatError string
@@ -28,7 +41,28 @@ func (err InvalidPolicyFormatError) Error() string {
 	return string(err)
 }
 
-// FIXME: NewDefaultPolicy, from default file (or environment if trusted?)
+// DefaultPolicy returns the default policy of the system.
+// Most applications should be using this method to get the policy configured
+// by the system administrator.
+// ctx should usually be nil, can be set to override the default.
+// NOTE: When this function returns an error, report it to the user and abort.
+// DO NOT hard-code fallback policies in your application.
+func DefaultPolicy(ctx *types.SystemContext) (*Policy, error) {
+	return NewPolicyFromFile(defaultPolicyPath(ctx))
+}
+
+// defaultPolicyPath returns a path to the default policy of the system.
+func defaultPolicyPath(ctx *types.SystemContext) string {
+	if ctx != nil {
+		if ctx.SignaturePolicyPath != "" {
+			return ctx.SignaturePolicyPath
+		}
+		if ctx.RootForImplicitAbsolutePaths != "" {
+			return filepath.Join(ctx.RootForImplicitAbsolutePaths, systemDefaultPolicyPath)
+		}
+	}
+	return systemDefaultPolicyPath
+}
 
 // NewPolicyFromFile returns a policy configured in the specified file.
 func NewPolicyFromFile(fileName string) (*Policy, error) {
@@ -36,7 +70,11 @@ func NewPolicyFromFile(fileName string) (*Policy, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewPolicyFromBytes(contents)
+	policy, err := NewPolicyFromBytes(contents)
+	if err != nil {
+		return nil, errors.Wrapf(err, "invalid policy in %q", fileName)
+	}
+	return policy, nil
 }
 
 // NewPolicyFromBytes returns a policy parsed from the specified blob.
@@ -55,13 +93,13 @@ var _ json.Unmarshaler = (*Policy)(nil)
 // UnmarshalJSON implements the json.Unmarshaler interface.
 func (p *Policy) UnmarshalJSON(data []byte) error {
 	*p = Policy{}
-	specific := policySpecificMap{}
+	transports := policyTransportsMap{}
 	if err := paranoidUnmarshalJSONObject(data, func(key string) interface{} {
 		switch key {
 		case "default":
 			return &p.Default
-		case "specific":
-			return &specific
+		case "transports":
+			return &transports
 		default:
 			return nil
 		}
@@ -72,28 +110,76 @@ func (p *Policy) UnmarshalJSON(data []byte) error {
 	if p.Default == nil {
 		return InvalidPolicyFormatError("Default policy is missing")
 	}
-	p.Specific = map[string]PolicyRequirements(specific)
+	p.Transports = map[string]PolicyTransportScopes(transports)
 	return nil
 }
 
-// policySpecificMap is a specialization of this map type for the strict JSON parsing semantics appropriate for the Policy.Specific member.
-type policySpecificMap map[string]PolicyRequirements
+// policyTransportsMap is a specialization of this map type for the strict JSON parsing semantics appropriate for the Policy.Transports member.
+type policyTransportsMap map[string]PolicyTransportScopes
 
-// Compile-time check that policySpecificMap implements json.Unmarshaler.
-var _ json.Unmarshaler = (*policySpecificMap)(nil)
+// Compile-time check that policyTransportsMap implements json.Unmarshaler.
+var _ json.Unmarshaler = (*policyTransportsMap)(nil)
 
 // UnmarshalJSON implements the json.Unmarshaler interface.
-func (m *policySpecificMap) UnmarshalJSON(data []byte) error {
+func (m *policyTransportsMap) UnmarshalJSON(data []byte) error {
+	// We can't unmarshal directly into map values because it is not possible to take an address of a map value.
+	// So, use a temporary map of pointers-to-slices and convert.
+	tmpMap := map[string]*PolicyTransportScopes{}
+	if err := paranoidUnmarshalJSONObject(data, func(key string) interface{} {
+		// transport can be nil
+		transport := transports.Get(key)
+		// paranoidUnmarshalJSONObject detects key duplication for us, check just to be safe.
+		if _, ok := tmpMap[key]; ok {
+			return nil
+		}
+		ptsWithTransport := policyTransportScopesWithTransport{
+			transport: transport,
+			dest:      &PolicyTransportScopes{}, // This allocates a new instance on each call.
+		}
+		tmpMap[key] = ptsWithTransport.dest
+		return &ptsWithTransport
+	}); err != nil {
+		return err
+	}
+	for key, ptr := range tmpMap {
+		(*m)[key] = *ptr
+	}
+	return nil
+}
+
+// Compile-time check that PolicyTransportScopes "implements"" json.Unmarshaler.
+// we want to only use policyTransportScopesWithTransport
+var _ json.Unmarshaler = (*PolicyTransportScopes)(nil)
+
+// UnmarshalJSON implements the json.Unmarshaler interface.
+func (m *PolicyTransportScopes) UnmarshalJSON(data []byte) error {
+	return errors.New("Do not try to unmarshal PolicyTransportScopes directly")
+}
+
+// policyTransportScopesWithTransport is a way to unmarshal a PolicyTransportScopes
+// while validating using a specific ImageTransport if not nil.
+type policyTransportScopesWithTransport struct {
+	transport types.ImageTransport
+	dest      *PolicyTransportScopes
+}
+
+// Compile-time check that policyTransportScopesWithTransport implements json.Unmarshaler.
+var _ json.Unmarshaler = (*policyTransportScopesWithTransport)(nil)
+
+// UnmarshalJSON implements the json.Unmarshaler interface.
+func (m *policyTransportScopesWithTransport) UnmarshalJSON(data []byte) error {
 	// We can't unmarshal directly into map values because it is not possible to take an address of a map value.
 	// So, use a temporary map of pointers-to-slices and convert.
 	tmpMap := map[string]*PolicyRequirements{}
 	if err := paranoidUnmarshalJSONObject(data, func(key string) interface{} {
-		// FIXME? We might want to validate the scope format.
-		// Note that reference.ParseNamed is unsuitable; it would understand "example.com" as
-		// "docker.io/library/example.com"
 		// paranoidUnmarshalJSONObject detects key duplication for us, check just to be safe.
 		if _, ok := tmpMap[key]; ok {
 			return nil
+		}
+		if key != "" && m.transport != nil {
+			if err := m.transport.ValidatePolicyConfigurationScope(key); err != nil {
+				return nil
+			}
 		}
 		ptr := &PolicyRequirements{} // This allocates a new instance on each call.
 		tmpMap[key] = ptr
@@ -102,7 +188,7 @@ func (m *policySpecificMap) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	for key, ptr := range tmpMap {
-		(*m)[key] = *ptr
+		(*m.dest)[key] = *ptr
 	}
 	return nil
 }
@@ -173,13 +259,8 @@ var _ json.Unmarshaler = (*prInsecureAcceptAnything)(nil)
 func (pr *prInsecureAcceptAnything) UnmarshalJSON(data []byte) error {
 	*pr = prInsecureAcceptAnything{}
 	var tmp prInsecureAcceptAnything
-	if err := paranoidUnmarshalJSONObject(data, func(key string) interface{} {
-		switch key {
-		case "type":
-			return &tmp.Type
-		default:
-			return nil
-		}
+	if err := paranoidUnmarshalJSONObjectExactFields(data, map[string]interface{}{
+		"type": &tmp.Type,
 	}); err != nil {
 		return err
 	}
@@ -208,13 +289,8 @@ var _ json.Unmarshaler = (*prReject)(nil)
 func (pr *prReject) UnmarshalJSON(data []byte) error {
 	*pr = prReject{}
 	var tmp prReject
-	if err := paranoidUnmarshalJSONObject(data, func(key string) interface{} {
-		switch key {
-		case "type":
-			return &tmp.Type
-		default:
-			return nil
-		}
+	if err := paranoidUnmarshalJSONObjectExactFields(data, map[string]interface{}{
+		"type": &tmp.Type,
 	}); err != nil {
 		return err
 	}
@@ -300,7 +376,7 @@ func (pr *prSignedBy) UnmarshalJSON(data []byte) error {
 		return InvalidPolicyFormatError(fmt.Sprintf("Unexpected policy requirement type \"%s\"", tmp.Type))
 	}
 	if signedIdentity == nil {
-		tmp.SignedIdentity = NewPRMMatchExact()
+		tmp.SignedIdentity = NewPRMMatchRepoDigestOrExact()
 	} else {
 		si, err := newPolicyReferenceMatchFromJSON(signedIdentity)
 		if err != nil {
@@ -321,7 +397,7 @@ func (pr *prSignedBy) UnmarshalJSON(data []byte) error {
 	case !gotKeyPath && !gotKeyData:
 		return InvalidPolicyFormatError("At least one of keyPath and keyData mus be specified")
 	default: // Coverage: This should never happen
-		return fmt.Errorf("Impossible keyPath/keyData presence combination!?")
+		return errors.Errorf("Impossible keyPath/keyData presence combination!?")
 	}
 	if err != nil {
 		return err
@@ -383,24 +459,15 @@ func (pr *prSignedBaseLayer) UnmarshalJSON(data []byte) error {
 	*pr = prSignedBaseLayer{}
 	var tmp prSignedBaseLayer
 	var baseLayerIdentity json.RawMessage
-	if err := paranoidUnmarshalJSONObject(data, func(key string) interface{} {
-		switch key {
-		case "type":
-			return &tmp.Type
-		case "baseLayerIdentity":
-			return &baseLayerIdentity
-		default:
-			return nil
-		}
+	if err := paranoidUnmarshalJSONObjectExactFields(data, map[string]interface{}{
+		"type":              &tmp.Type,
+		"baseLayerIdentity": &baseLayerIdentity,
 	}); err != nil {
 		return err
 	}
 
 	if tmp.Type != prTypeSignedBaseLayer {
 		return InvalidPolicyFormatError(fmt.Sprintf("Unexpected policy requirement type \"%s\"", tmp.Type))
-	}
-	if baseLayerIdentity == nil {
-		return InvalidPolicyFormatError(fmt.Sprintf("baseLayerIdentity not specified"))
 	}
 	bli, err := newPolicyReferenceMatchFromJSON(baseLayerIdentity)
 	if err != nil {
@@ -415,7 +482,7 @@ func (pr *prSignedBaseLayer) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// newPolicyRequirementFromJSON parses JSON data into a PolicyReferenceMatch implementation.
+// newPolicyReferenceMatchFromJSON parses JSON data into a PolicyReferenceMatch implementation.
 func newPolicyReferenceMatchFromJSON(data []byte) (PolicyReferenceMatch, error) {
 	var typeField prmCommon
 	if err := json.Unmarshal(data, &typeField); err != nil {
@@ -425,6 +492,8 @@ func newPolicyReferenceMatchFromJSON(data []byte) (PolicyReferenceMatch, error) 
 	switch typeField.Type {
 	case prmTypeMatchExact:
 		res = &prmMatchExact{}
+	case prmTypeMatchRepoDigestOrExact:
+		res = &prmMatchRepoDigestOrExact{}
 	case prmTypeMatchRepository:
 		res = &prmMatchRepository{}
 	case prmTypeExactReference:
@@ -457,13 +526,8 @@ var _ json.Unmarshaler = (*prmMatchExact)(nil)
 func (prm *prmMatchExact) UnmarshalJSON(data []byte) error {
 	*prm = prmMatchExact{}
 	var tmp prmMatchExact
-	if err := paranoidUnmarshalJSONObject(data, func(key string) interface{} {
-		switch key {
-		case "type":
-			return &tmp.Type
-		default:
-			return nil
-		}
+	if err := paranoidUnmarshalJSONObjectExactFields(data, map[string]interface{}{
+		"type": &tmp.Type,
 	}); err != nil {
 		return err
 	}
@@ -472,6 +536,36 @@ func (prm *prmMatchExact) UnmarshalJSON(data []byte) error {
 		return InvalidPolicyFormatError(fmt.Sprintf("Unexpected policy requirement type \"%s\"", tmp.Type))
 	}
 	*prm = *newPRMMatchExact()
+	return nil
+}
+
+// newPRMMatchRepoDigestOrExact is NewPRMMatchRepoDigestOrExact, except it resturns the private type.
+func newPRMMatchRepoDigestOrExact() *prmMatchRepoDigestOrExact {
+	return &prmMatchRepoDigestOrExact{prmCommon{Type: prmTypeMatchRepoDigestOrExact}}
+}
+
+// NewPRMMatchRepoDigestOrExact returns a new "matchRepoDigestOrExact" PolicyReferenceMatch.
+func NewPRMMatchRepoDigestOrExact() PolicyReferenceMatch {
+	return newPRMMatchRepoDigestOrExact()
+}
+
+// Compile-time check that prmMatchRepoDigestOrExact implements json.Unmarshaler.
+var _ json.Unmarshaler = (*prmMatchRepoDigestOrExact)(nil)
+
+// UnmarshalJSON implements the json.Unmarshaler interface.
+func (prm *prmMatchRepoDigestOrExact) UnmarshalJSON(data []byte) error {
+	*prm = prmMatchRepoDigestOrExact{}
+	var tmp prmMatchRepoDigestOrExact
+	if err := paranoidUnmarshalJSONObjectExactFields(data, map[string]interface{}{
+		"type": &tmp.Type,
+	}); err != nil {
+		return err
+	}
+
+	if tmp.Type != prmTypeMatchRepoDigestOrExact {
+		return InvalidPolicyFormatError(fmt.Sprintf("Unexpected policy requirement type \"%s\"", tmp.Type))
+	}
+	*prm = *newPRMMatchRepoDigestOrExact()
 	return nil
 }
 
@@ -492,13 +586,8 @@ var _ json.Unmarshaler = (*prmMatchRepository)(nil)
 func (prm *prmMatchRepository) UnmarshalJSON(data []byte) error {
 	*prm = prmMatchRepository{}
 	var tmp prmMatchRepository
-	if err := paranoidUnmarshalJSONObject(data, func(key string) interface{} {
-		switch key {
-		case "type":
-			return &tmp.Type
-		default:
-			return nil
-		}
+	if err := paranoidUnmarshalJSONObjectExactFields(data, map[string]interface{}{
+		"type": &tmp.Type,
 	}); err != nil {
 		return err
 	}
@@ -512,7 +601,7 @@ func (prm *prmMatchRepository) UnmarshalJSON(data []byte) error {
 
 // newPRMExactReference is NewPRMExactReference, except it resturns the private type.
 func newPRMExactReference(dockerReference string) (*prmExactReference, error) {
-	ref, err := reference.ParseNamed(dockerReference)
+	ref, err := reference.ParseNormalizedNamed(dockerReference)
 	if err != nil {
 		return nil, InvalidPolicyFormatError(fmt.Sprintf("Invalid format of dockerReference %s: %s", dockerReference, err.Error()))
 	}
@@ -537,15 +626,9 @@ var _ json.Unmarshaler = (*prmExactReference)(nil)
 func (prm *prmExactReference) UnmarshalJSON(data []byte) error {
 	*prm = prmExactReference{}
 	var tmp prmExactReference
-	if err := paranoidUnmarshalJSONObject(data, func(key string) interface{} {
-		switch key {
-		case "type":
-			return &tmp.Type
-		case "dockerReference":
-			return &tmp.DockerReference
-		default:
-			return nil
-		}
+	if err := paranoidUnmarshalJSONObjectExactFields(data, map[string]interface{}{
+		"type":            &tmp.Type,
+		"dockerReference": &tmp.DockerReference,
 	}); err != nil {
 		return err
 	}
@@ -564,7 +647,7 @@ func (prm *prmExactReference) UnmarshalJSON(data []byte) error {
 
 // newPRMExactRepository is NewPRMExactRepository, except it resturns the private type.
 func newPRMExactRepository(dockerRepository string) (*prmExactRepository, error) {
-	if _, err := reference.ParseNamed(dockerRepository); err != nil {
+	if _, err := reference.ParseNormalizedNamed(dockerRepository); err != nil {
 		return nil, InvalidPolicyFormatError(fmt.Sprintf("Invalid format of dockerRepository %s: %s", dockerRepository, err.Error()))
 	}
 	return &prmExactRepository{
@@ -585,15 +668,9 @@ var _ json.Unmarshaler = (*prmExactRepository)(nil)
 func (prm *prmExactRepository) UnmarshalJSON(data []byte) error {
 	*prm = prmExactRepository{}
 	var tmp prmExactRepository
-	if err := paranoidUnmarshalJSONObject(data, func(key string) interface{} {
-		switch key {
-		case "type":
-			return &tmp.Type
-		case "dockerRepository":
-			return &tmp.DockerRepository
-		default:
-			return nil
-		}
+	if err := paranoidUnmarshalJSONObjectExactFields(data, map[string]interface{}{
+		"type":             &tmp.Type,
+		"dockerRepository": &tmp.DockerRepository,
 	}); err != nil {
 		return err
 	}

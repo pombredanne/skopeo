@@ -12,9 +12,6 @@ import (
 const (
 	privateRegistryURL0 = "127.0.0.1:5000"
 	privateRegistryURL1 = "127.0.0.1:5001"
-	privateRegistryURL2 = "127.0.0.1:5002"
-	privateRegistryURL3 = "127.0.0.1:5003"
-	privateRegistryURL4 = "127.0.0.1:5004"
 )
 
 func Test(t *testing.T) {
@@ -26,15 +23,13 @@ func init() {
 }
 
 type SkopeoSuite struct {
-	regV1         *testRegistryV1
 	regV2         *testRegistryV2
-	regV2Shema1   *testRegistryV2
-	regV1WithAuth *testRegistryV1 // does v1 support auth?
 	regV2WithAuth *testRegistryV2
 }
 
 func (s *SkopeoSuite) SetUpSuite(c *check.C) {
-
+	_, err := exec.LookPath(skopeoBinary)
+	c.Assert(err, check.IsNil)
 }
 
 func (s *SkopeoSuite) TearDownSuite(c *check.C) {
@@ -42,23 +37,13 @@ func (s *SkopeoSuite) TearDownSuite(c *check.C) {
 }
 
 func (s *SkopeoSuite) SetUpTest(c *check.C) {
-	_, err := exec.LookPath(skopeoBinary)
-	c.Assert(err, check.IsNil)
-
-	s.regV1 = setupRegistryV1At(c, privateRegistryURL0, false) // TODO:(runcom)
-	s.regV2 = setupRegistryV2At(c, privateRegistryURL1, false, false)
-	s.regV2Shema1 = setupRegistryV2At(c, privateRegistryURL2, false, true)
-	s.regV1WithAuth = setupRegistryV1At(c, privateRegistryURL3, true) // not used
-	s.regV2WithAuth = setupRegistryV2At(c, privateRegistryURL4, true, false)
+	s.regV2 = setupRegistryV2At(c, privateRegistryURL0, false, false)
+	s.regV2WithAuth = setupRegistryV2At(c, privateRegistryURL1, true, false)
 }
 
 func (s *SkopeoSuite) TearDownTest(c *check.C) {
-	// not checking V1 registries now...
 	if s.regV2 != nil {
 		s.regV2.Close()
-	}
-	if s.regV2Shema1 != nil {
-		s.regV2Shema1.Close()
 	}
 	if s.regV2WithAuth != nil {
 		//cmd := exec.Command("docker", "logout", s.regV2WithAuth)
@@ -75,31 +60,30 @@ func (s *SkopeoSuite) TestVersion(c *check.C) {
 	assertSkopeoSucceeds(c, wanted, "--version")
 }
 
-const (
-	errFetchManifestRegexp = ".*error fetching manifest: status code: %s.*"
-)
-
 func (s *SkopeoSuite) TestCanAuthToPrivateRegistryV2WithoutDockerCfg(c *check.C) {
-	// TODO(runcom)
-	c.Skip("we need to restore --username --password flags!")
-	wanted := fmt.Sprintf(errFetchManifestRegexp, "401")
-	assertSkopeoFails(c, wanted, "--docker-cfg=''", "--username="+s.regV2WithAuth.username, "--password="+s.regV2WithAuth.password, "inspect", fmt.Sprintf("docker://%s/busybox:latest", s.regV2WithAuth.url))
+	wanted := ".*manifest unknown: manifest unknown.*"
+	assertSkopeoFails(c, wanted, "--tls-verify=false", "inspect", "--creds="+s.regV2WithAuth.username+":"+s.regV2WithAuth.password, fmt.Sprintf("docker://%s/busybox:latest", s.regV2WithAuth.url))
 }
 
 func (s *SkopeoSuite) TestNeedAuthToPrivateRegistryV2WithoutDockerCfg(c *check.C) {
-	// TODO(runcom): mock the empty docker-cfg by removing it in the test itself (?)
-	c.Skip("mock empty docker config")
-	wanted := fmt.Sprintf(errFetchManifestRegexp, "401")
-	assertSkopeoFails(c, wanted, "--docker-cfg=''", "inspect", fmt.Sprintf("docker://%s/busybox:latest", s.regV2WithAuth.url))
+	wanted := ".*unauthorized: authentication required.*"
+	assertSkopeoFails(c, wanted, "--tls-verify=false", "inspect", fmt.Sprintf("docker://%s/busybox:latest", s.regV2WithAuth.url))
+}
+
+func (s *SkopeoSuite) TestCertDirInsteadOfCertPath(c *check.C) {
+	wanted := ".*flag provided but not defined: -cert-path.*"
+	assertSkopeoFails(c, wanted, "--tls-verify=false", "inspect", fmt.Sprintf("docker://%s/busybox:latest", s.regV2WithAuth.url), "--cert-path=/")
+	wanted = ".*unauthorized: authentication required.*"
+	assertSkopeoFails(c, wanted, "--tls-verify=false", "inspect", fmt.Sprintf("docker://%s/busybox:latest", s.regV2WithAuth.url), "--cert-dir=/etc/docker/certs.d/")
 }
 
 // TODO(runcom): as soon as we can push to registries ensure you can inspect here
 // not just get image not found :)
 func (s *SkopeoSuite) TestNoNeedAuthToPrivateRegistryV2ImageNotFound(c *check.C) {
-	out, err := exec.Command(skopeoBinary, "inspect", fmt.Sprintf("docker://%s/busybox:latest", s.regV2.url)).CombinedOutput()
+	out, err := exec.Command(skopeoBinary, "--tls-verify=false", "inspect", fmt.Sprintf("docker://%s/busybox:latest", s.regV2.url)).CombinedOutput()
 	c.Assert(err, check.NotNil, check.Commentf(string(out)))
-	wanted := fmt.Sprintf(errFetchManifestRegexp, "404")
+	wanted := ".*manifest unknown.*"
 	c.Assert(string(out), check.Matches, "(?s)"+wanted) // (?s) : '.' will also match newlines
-	wanted = fmt.Sprintf(errFetchManifestRegexp, "401")
+	wanted = ".*unauthorized: authentication required.*"
 	c.Assert(string(out), check.Not(check.Matches), "(?s)"+wanted) // (?s) : '.' will also match newlines
 }

@@ -1,57 +1,77 @@
 package directory
 
 import (
-	"fmt"
+	"context"
 	"io"
 	"io/ioutil"
 	"os"
 
+	"github.com/containers/image/manifest"
 	"github.com/containers/image/types"
-	"github.com/docker/docker/reference"
+	"github.com/opencontainers/go-digest"
+	"github.com/pkg/errors"
 )
 
 type dirImageSource struct {
-	dir string
+	ref dirReference
 }
 
-// NewImageSource returns an ImageSource reading from an existing directory.
-func NewImageSource(dir string) types.ImageSource {
-	return &dirImageSource{dir}
+// newImageSource returns an ImageSource reading from an existing directory.
+// The caller must call .Close() on the returned ImageSource.
+func newImageSource(ref dirReference) types.ImageSource {
+	return &dirImageSource{ref}
 }
 
-// IntendedDockerReference returns the Docker reference for this image, _as specified by the user_
-// (not as the image itself, or its underlying storage, claims).  Should be fully expanded, i.e. !reference.IsNameOnly.
-// This can be used e.g. to determine which public keys are trusted for this image.
-// May be nil if unknown.
-func (s *dirImageSource) IntendedDockerReference() reference.Named {
+// Reference returns the reference used to set up this source, _as specified by the user_
+// (not as the image itself, or its underlying storage, claims).  This can be used e.g. to determine which public keys are trusted for this image.
+func (s *dirImageSource) Reference() types.ImageReference {
+	return s.ref
+}
+
+// Close removes resources associated with an initialized ImageSource, if any.
+func (s *dirImageSource) Close() error {
 	return nil
 }
 
-// it's up to the caller to determine the MIME type of the returned manifest's bytes
-func (s *dirImageSource) GetManifest(_ []string) ([]byte, string, error) {
-	m, err := ioutil.ReadFile(manifestPath(s.dir))
+// GetManifest returns the image's manifest along with its MIME type (which may be empty when it can't be determined but the manifest is available).
+// It may use a remote (= slow) service.
+// If instanceDigest is not nil, it contains a digest of the specific manifest instance to retrieve (when the primary manifest is a manifest list);
+// this never happens if the primary manifest is not a manifest list (e.g. if the source never returns manifest lists).
+func (s *dirImageSource) GetManifest(instanceDigest *digest.Digest) ([]byte, string, error) {
+	if instanceDigest != nil {
+		return nil, "", errors.Errorf(`Getting target manifest not supported by "dir:"`)
+	}
+	m, err := ioutil.ReadFile(s.ref.manifestPath())
 	if err != nil {
 		return nil, "", err
 	}
-	return m, "", err
+	return m, manifest.GuessMIMEType(m), err
 }
 
-func (s *dirImageSource) GetBlob(digest string) (io.ReadCloser, int64, error) {
-	r, err := os.Open(layerPath(s.dir, digest))
+// GetBlob returns a stream for the specified blob, and the blob’s size (or -1 if unknown).
+func (s *dirImageSource) GetBlob(info types.BlobInfo) (io.ReadCloser, int64, error) {
+	r, err := os.Open(s.ref.layerPath(info.Digest))
 	if err != nil {
 		return nil, 0, nil
 	}
-	fi, err := os.Stat(layerPath(s.dir, digest))
+	fi, err := r.Stat()
 	if err != nil {
 		return nil, 0, nil
 	}
 	return r, fi.Size(), nil
 }
 
-func (s *dirImageSource) GetSignatures() ([][]byte, error) {
+// GetSignatures returns the image's signatures.  It may use a remote (= slow) service.
+// If instanceDigest is not nil, it contains a digest of the specific manifest instance to retrieve signatures for
+// (when the primary manifest is a manifest list); this never happens if the primary manifest is not a manifest list
+// (e.g. if the source never returns manifest lists).
+func (s *dirImageSource) GetSignatures(ctx context.Context, instanceDigest *digest.Digest) ([][]byte, error) {
+	if instanceDigest != nil {
+		return nil, errors.Errorf(`Manifests lists are not supported by "dir:"`)
+	}
 	signatures := [][]byte{}
 	for i := 0; ; i++ {
-		signature, err := ioutil.ReadFile(signaturePath(s.dir, i))
+		signature, err := ioutil.ReadFile(s.ref.signaturePath(i))
 		if err != nil {
 			if os.IsNotExist(err) {
 				break
@@ -61,8 +81,4 @@ func (s *dirImageSource) GetSignatures() ([][]byte, error) {
 		signatures = append(signatures, signature)
 	}
 	return signatures, nil
-}
-
-func (s *dirImageSource) Delete() error {
-	return fmt.Errorf("directory#dirImageSource.Delete() not implmented")
 }

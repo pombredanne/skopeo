@@ -2,24 +2,27 @@
 
 package signature
 
-import "github.com/containers/image/types"
+import (
+	"fmt"
 
-func (pr *prInsecureAcceptAnything) isSignatureAuthorAccepted(image types.Image, sig []byte) (signatureAcceptanceResult, *Signature, error) {
+	"github.com/containers/image/transports"
+	"github.com/containers/image/types"
+)
+
+func (pr *prInsecureAcceptAnything) isSignatureAuthorAccepted(image types.UnparsedImage, sig []byte) (signatureAcceptanceResult, *Signature, error) {
 	// prInsecureAcceptAnything semantics: Every image is allowed to run,
 	// but this does not consider the signature as verified.
 	return sarUnknown, nil, nil
 }
 
-func (pr *prInsecureAcceptAnything) isRunningImageAllowed(image types.Image) (bool, error) {
+func (pr *prInsecureAcceptAnything) isRunningImageAllowed(image types.UnparsedImage) (bool, error) {
 	return true, nil
 }
 
-func (pr *prReject) isSignatureAuthorAccepted(image types.Image, sig []byte) (signatureAcceptanceResult, *Signature, error) {
-	// FIXME? Name the image, or better the matched scope in Policy.Specific.
-	return sarRejected, nil, PolicyRequirementError("Any signatures for these images are rejected by policy.")
+func (pr *prReject) isSignatureAuthorAccepted(image types.UnparsedImage, sig []byte) (signatureAcceptanceResult, *Signature, error) {
+	return sarRejected, nil, PolicyRequirementError(fmt.Sprintf("Any signatures for image %s are rejected by policy.", transports.ImageName(image.Reference())))
 }
 
-func (pr *prReject) isRunningImageAllowed(image types.Image) (bool, error) {
-	// FIXME? Name the image, or better the matched scope in Policy.Specific.
-	return false, PolicyRequirementError("Running these images is rejected by policy.")
+func (pr *prReject) isRunningImageAllowed(image types.UnparsedImage) (bool, error) {
+	return false, PolicyRequirementError(fmt.Sprintf("Running image %s is rejected by policy.", transports.ImageName(image.Reference())))
 }

@@ -2,80 +2,89 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"strings"
 
-	"github.com/containers/image/directory"
-	"github.com/containers/image/docker"
-	"github.com/containers/image/image"
-	"github.com/containers/image/oci"
-	"github.com/containers/image/openshift"
+	"github.com/containers/image/transports/alltransports"
 	"github.com/containers/image/types"
 	"github.com/urfave/cli"
 )
 
-const (
-	// atomicPrefix is the URL-like schema prefix used for Atomic registry image references.
-	atomicPrefix = "atomic:"
-	// dockerPrefix is the URL-like schema prefix used for Docker image references.
-	dockerPrefix = "docker://"
-	// directoryPrefix is the URL-like schema prefix used for local directories (for debugging)
-	directoryPrefix = "dir:"
-	// ociPrefix is the URL-like schema prefix used for OCI images.
-	ociPrefix = "oci:"
-)
-
-// ParseImage converts image URL-like string to an initialized handler for that image.
-func parseImage(c *cli.Context) (types.Image, error) {
-	var (
-		imgName   = c.Args().First()
-		certPath  = c.GlobalString("cert-path")
-		tlsVerify = c.GlobalBool("tls-verify")
-	)
-	switch {
-	case strings.HasPrefix(imgName, dockerPrefix):
-		return docker.NewImage(strings.TrimPrefix(imgName, dockerPrefix), certPath, tlsVerify)
-		//case strings.HasPrefix(img, appcPrefix):
-		//
-	case strings.HasPrefix(imgName, directoryPrefix):
-		src := directory.NewImageSource(strings.TrimPrefix(imgName, directoryPrefix))
-		return image.FromSource(src, nil), nil
+func contextFromGlobalOptions(c *cli.Context, flagPrefix string) (*types.SystemContext, error) {
+	ctx := &types.SystemContext{
+		RegistriesDirPath:  c.GlobalString("registries.d"),
+		ArchitectureChoice: c.GlobalString("override-arch"),
+		OSChoice:           c.GlobalString("override-os"),
+		DockerCertPath:     c.String(flagPrefix + "cert-dir"),
+		// DEPRECATED: keep this here for backward compatibility, but override
+		// them if per subcommand flags are provided (see below).
+		DockerInsecureSkipTLSVerify: !c.GlobalBoolT("tls-verify"),
+		OSTreeTmpDirPath:            c.String(flagPrefix + "ostree-tmp-dir"),
+		OCISharedBlobDirPath:        c.String(flagPrefix + "shared-blob-dir"),
+		DirForceCompress:            c.Bool(flagPrefix + "compress"),
 	}
-	return nil, errors.New("no valid prefix provided")
+	if c.IsSet(flagPrefix + "tls-verify") {
+		ctx.DockerInsecureSkipTLSVerify = !c.BoolT(flagPrefix + "tls-verify")
+	}
+	if c.IsSet(flagPrefix + "creds") {
+		var err error
+		ctx.DockerAuthConfig, err = getDockerAuth(c.String(flagPrefix + "creds"))
+		if err != nil {
+			return nil, err
+		}
+	}
+	return ctx, nil
+}
+
+func parseCreds(creds string) (string, string, error) {
+	if creds == "" {
+		return "", "", errors.New("credentials can't be empty")
+	}
+	up := strings.SplitN(creds, ":", 2)
+	if len(up) == 1 {
+		return up[0], "", nil
+	}
+	if up[0] == "" {
+		return "", "", errors.New("username can't be empty")
+	}
+	return up[0], up[1], nil
+}
+
+func getDockerAuth(creds string) (*types.DockerAuthConfig, error) {
+	username, password, err := parseCreds(creds)
+	if err != nil {
+		return nil, err
+	}
+	return &types.DockerAuthConfig{
+		Username: username,
+		Password: password,
+	}, nil
+}
+
+// parseImage converts image URL-like string to an initialized handler for that image.
+// The caller must call .Close() on the returned ImageCloser.
+func parseImage(c *cli.Context) (types.ImageCloser, error) {
+	imgName := c.Args().First()
+	ref, err := alltransports.ParseImageName(imgName)
+	if err != nil {
+		return nil, err
+	}
+	ctx, err := contextFromGlobalOptions(c, "")
+	if err != nil {
+		return nil, err
+	}
+	return ref.NewImage(ctx)
 }
 
 // parseImageSource converts image URL-like string to an ImageSource.
+// The caller must call .Close() on the returned ImageSource.
 func parseImageSource(c *cli.Context, name string) (types.ImageSource, error) {
-	var (
-		certPath  = c.GlobalString("cert-path")
-		tlsVerify = c.GlobalBool("tls-verify") // FIXME!! defaults to false?
-	)
-	switch {
-	case strings.HasPrefix(name, dockerPrefix):
-		return docker.NewImageSource(strings.TrimPrefix(name, dockerPrefix), certPath, tlsVerify)
-	case strings.HasPrefix(name, atomicPrefix):
-		return openshift.NewImageSource(strings.TrimPrefix(name, atomicPrefix), certPath, tlsVerify)
-	case strings.HasPrefix(name, directoryPrefix):
-		return directory.NewImageSource(strings.TrimPrefix(name, directoryPrefix)), nil
+	ref, err := alltransports.ParseImageName(name)
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("Unrecognized image reference %s", name)
-}
-
-// parseImageDestination converts image URL-like string to an ImageDestination.
-func parseImageDestination(c *cli.Context, name string) (types.ImageDestination, error) {
-	var (
-		certPath  = c.GlobalString("cert-path")
-		tlsVerify = c.GlobalBool("tls-verify") // FIXME!! defaults to false?
-	)
-	switch {
-	case strings.HasPrefix(name, dockerPrefix):
-		return docker.NewImageDestination(strings.TrimPrefix(name, dockerPrefix), certPath, tlsVerify)
-	case strings.HasPrefix(name, atomicPrefix):
-		return openshift.NewImageDestination(strings.TrimPrefix(name, atomicPrefix), certPath, tlsVerify)
-	case strings.HasPrefix(name, directoryPrefix):
-		return directory.NewImageDestination(strings.TrimPrefix(name, directoryPrefix)), nil
-	case strings.HasPrefix(name, ociPrefix):
-		return oci.NewImageDestination(strings.TrimPrefix(name, ociPrefix))
+	ctx, err := contextFromGlobalOptions(c, "")
+	if err != nil {
+		return nil, err
 	}
-	return nil, fmt.Errorf("Unrecognized image reference %s", name)
+	return ref.NewImageSource(ctx)
 }

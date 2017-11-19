@@ -3,10 +3,15 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/containers/image/docker"
 	"github.com/containers/image/manifest"
+	"github.com/containers/image/transports"
+	"github.com/opencontainers/go-digest"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
 
@@ -14,7 +19,7 @@ import (
 type inspectOutput struct {
 	Name          string `json:",omitempty"`
 	Tag           string `json:",omitempty"`
-	Digest        string
+	Digest        digest.Digest
 	RepoTags      []string
 	Created       time.Time
 	DockerVersion string
@@ -26,24 +31,57 @@ type inspectOutput struct {
 
 var inspectCmd = cli.Command{
 	Name:  "inspect",
-	Usage: "inspect images on a registry",
+	Usage: "Inspect image IMAGE-NAME",
+	Description: fmt.Sprintf(`
+	Return low-level information about "IMAGE-NAME" in a registry/transport
+
+	Supported transports:
+	%s
+
+	See skopeo(1) section "IMAGE NAMES" for the expected format
+	`, strings.Join(transports.ListNames(), ", ")),
+	ArgsUsage: "IMAGE-NAME",
 	Flags: []cli.Flag{
+		cli.StringFlag{
+			Name:  "cert-dir",
+			Value: "",
+			Usage: "use certificates at `PATH` (*.crt, *.cert, *.key) to connect to the registry",
+		},
+		cli.BoolTFlag{
+			Name:  "tls-verify",
+			Usage: "require HTTPS and verify certificates when talking to container registries (defaults to true)",
+		},
 		cli.BoolFlag{
 			Name:  "raw",
 			Usage: "output raw manifest",
 		},
+		cli.StringFlag{
+			Name:  "creds",
+			Value: "",
+			Usage: "Use `USERNAME[:PASSWORD]` for accessing the registry",
+		},
 	},
-	Action: func(c *cli.Context) error {
+	Action: func(c *cli.Context) (retErr error) {
 		img, err := parseImage(c)
 		if err != nil {
 			return err
 		}
+
+		defer func() {
+			if err := img.Close(); err != nil {
+				retErr = errors.Wrapf(retErr, fmt.Sprintf("(could not close image: %v) ", err))
+			}
+		}()
+
 		rawManifest, _, err := img.Manifest()
 		if err != nil {
 			return err
 		}
 		if c.Bool("raw") {
-			fmt.Fprintln(c.App.Writer, string(rawManifest))
+			_, err := c.App.Writer.Write(rawManifest)
+			if err != nil {
+				return fmt.Errorf("Error writing manifest to standard output: %v", err)
+			}
 			return nil
 		}
 		imgInspect, err := img.Inspect()
@@ -70,7 +108,13 @@ var inspectCmd = cli.Command{
 			outputData.Name = dockerImg.SourceRefFullName()
 			outputData.RepoTags, err = dockerImg.GetRepositoryTags()
 			if err != nil {
-				return fmt.Errorf("Error determining repository tags: %v", err)
+				// some registries may decide to block the "list all tags" endpoint
+				// gracefully allow the inspect to continue in this case. Currently
+				// the IBM Bluemix container registry has this restriction.
+				if !strings.Contains(err.Error(), "401") {
+					return fmt.Errorf("Error determining repository tags: %v", err)
+				}
+				logrus.Warnf("Registry disallows tag list retrieval; skipping")
 			}
 		}
 		out, err := json.MarshalIndent(outputData, "", "    ")
